@@ -41,7 +41,10 @@ impl deno_core::ModuleLoader for TsModuleLoader {
         referrer: &str,
         _kind: deno_core::ResolutionKind,
     ) -> Result<deno_core::ModuleSpecifier, deno_core::error::AnyError> {
-        deno_core::resolve_import(specifier, referrer).map_err(|e| e.into())
+        match specifier {
+            "jet:runtime" => deno_core::ModuleSpecifier::parse(specifier).map_err(|e| e.into()),
+            _ => deno_core::resolve_import(specifier, referrer).map_err(|e| e.into()),
+        }
     }
 
     fn load(
@@ -52,26 +55,46 @@ impl deno_core::ModuleLoader for TsModuleLoader {
     ) -> std::pin::Pin<Box<deno_core::ModuleSourceFuture>> {
         let module_specifier = module_specifier.clone();
         async move {
-            let path = module_specifier.to_file_path().unwrap();
+            let (media_type, module_type, should_transpile, code) = if module_specifier.scheme() == "jet" {
+                (
+                    MediaType::TypeScript,
+                    deno_core::ModuleType::JavaScript,
+                    true,
+                    String::from(
+                        r#"
+                        export namespace JetRuntime {
+                            export function greet(name: string): void {
+                                console.log(`Hello ${name}`);
+                            }
+                        }
+                        "#,
+                    ),
+                )
+            } else {
+                let path = module_specifier.to_file_path().unwrap();
 
-            let media_type = MediaType::from(&path);
-            let (module_type, should_transpile) = match MediaType::from(&path) {
-                MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => {
-                    (deno_core::ModuleType::JavaScript, false)
-                }
-                MediaType::Jsx => (deno_core::ModuleType::JavaScript, true),
-                MediaType::TypeScript
-                | MediaType::Mts
-                | MediaType::Cts
-                | MediaType::Dts
-                | MediaType::Dmts
-                | MediaType::Dcts
-                | MediaType::Tsx => (deno_core::ModuleType::JavaScript, true),
-                MediaType::Json => (deno_core::ModuleType::Json, false),
-                _ => panic!("Unknown extension {:?}", path.extension()),
+                let code = std::fs::read_to_string(&path)?;
+
+                let media_type = MediaType::from(&path);
+                let (module_type, should_transpile) = match media_type {
+                    MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => {
+                        (deno_core::ModuleType::JavaScript, false)
+                    }
+                    MediaType::Jsx => (deno_core::ModuleType::JavaScript, true),
+                    MediaType::TypeScript
+                    | MediaType::Mts
+                    | MediaType::Cts
+                    | MediaType::Dts
+                    | MediaType::Dmts
+                    | MediaType::Dcts
+                    | MediaType::Tsx => (deno_core::ModuleType::JavaScript, true),
+                    MediaType::Json => (deno_core::ModuleType::Json, false),
+                    _ => panic!("Unknown extension {:?}", path.extension()),
+                };
+
+                (media_type, module_type, should_transpile, code)
             };
 
-            let code = std::fs::read_to_string(&path)?;
             let code = if should_transpile {
                 let parsed = deno_ast::parse_module(ParseParams {
                     specifier: module_specifier.to_string(),
@@ -100,9 +123,7 @@ impl deno_core::ModuleLoader for TsModuleLoader {
 async fn run_js(file_path: &str) -> Result<(), AnyError> {
     let main_module = deno_core::resolve_path(file_path)?;
     let runjs_extension = Extension::builder("runjs")
-        .esm(include_js_files!(
-            "runtime.js",
-        ))
+        .esm(include_js_files!("runtime.js",))
         .ops(vec![
             op_read_file::decl(),
             op_write_file::decl(),

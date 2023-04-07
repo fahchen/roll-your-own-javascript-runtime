@@ -1,4 +1,5 @@
-console.log("Hello", "runjs!");
+import { JetRuntime } from "jet:runtime";
+JetRuntime.greet("Alice");
 
 interface Foo {
   bar: string;

@@ -60,52 +60,28 @@ impl deno_core::ModuleLoader for TsModuleLoader {
             let (media_type, module_type, should_transpile, code) =
                 if module_specifier.scheme() == "jet" {
                     match module_specifier.path() {
-                        "runtime" => (
-                            MediaType::TypeScript,
-                            deno_core::ModuleType::JavaScript,
-                            true,
-                            String::from(
-                                r#"
-                                export namespace JetRuntime {
-                                    export function greet(name: string): void {
-                                        console.log(`Hello ${name}`);
-                                    }
-                                }
-                                "#,
-                            ),
-                        ),
-                        "query" => (
-                            MediaType::TypeScript,
-                            deno_core::ModuleType::JavaScript,
-                            true,
-                            String::from(
-                                r#"
-                                interface Request {
-                                    to: string
-                                };
+                        "runtime" => {
+                            let code = std::fs::read_to_string("src/jet_runtime.ts")
+                                .expect("Can't find jet_runtime.ts.");
 
-                                interface Context {
-                                    current_user: {
-                                        name: string
-                                    }
-                                };
+                            (
+                                MediaType::TypeScript,
+                                deno_core::ModuleType::JavaScript,
+                                true,
+                                code,
+                            )
+                        }
+                        "query" => {
+                            let code = std::fs::read_to_string("src/query.ts")
+                                .expect("Can't find query.ts.");
 
-                                class Response {
-                                    status: number;
-                                    data: string;
-
-                                    constructor(status: number, data: string) {
-                                        this.status = status;
-                                        this.data = data;
-                                    }
-                                };
-
-                                export async function handle(request: Request, context: Context): Response {
-                                    return new Response(200, `Hello ${request.to}, this is ${context.current_user.name}.`);
-                                }
-                                "#,
-                            ),
-                        ),
+                            (
+                                MediaType::TypeScript,
+                                deno_core::ModuleType::JavaScript,
+                                true,
+                                code,
+                            )
+                        }
                         path => panic!("path {} not found", path),
                     }
                 } else {
@@ -175,15 +151,9 @@ async fn run_js(file_path: &str) -> Result<deno_core::serde_json::Value, AnyErro
         ..Default::default()
     });
 
-    let value_global = js_runtime
-        .execute_script(
-            "runner",
-            r#"(async () => {
-                const query = await import("jet:query");
-                return query.handle({ to: "Alice" }, { current_user: { name: "Alice" }});
-            })();"#,
-        )
-        .unwrap();
+    let runner_code = std::fs::read_to_string("src/runner.ts").expect("Can't find runner.ts.");
+
+    let value_global = js_runtime.execute_script("runner", &runner_code).unwrap();
 
     let result_global = js_runtime.resolve_value(value_global).await.unwrap();
     let scope = &mut js_runtime.handle_scope();

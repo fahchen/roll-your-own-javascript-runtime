@@ -5,6 +5,7 @@ use deno_core::error::AnyError;
 use deno_core::futures::FutureExt;
 use deno_core::include_js_files;
 use deno_core::op;
+use deno_core::v8::Local;
 use deno_core::Extension;
 use std::rc::Rc;
 
@@ -43,6 +44,7 @@ impl deno_core::ModuleLoader for TsModuleLoader {
     ) -> Result<deno_core::ModuleSpecifier, deno_core::error::AnyError> {
         match specifier {
             "jet:runtime" => deno_core::ModuleSpecifier::parse(specifier).map_err(|e| e.into()),
+            "jet:query" => deno_core::ModuleSpecifier::parse(specifier).map_err(|e| e.into()),
             _ => deno_core::resolve_import(specifier, referrer).map_err(|e| e.into()),
         }
     }
@@ -55,45 +57,81 @@ impl deno_core::ModuleLoader for TsModuleLoader {
     ) -> std::pin::Pin<Box<deno_core::ModuleSourceFuture>> {
         let module_specifier = module_specifier.clone();
         async move {
-            let (media_type, module_type, should_transpile, code) = if module_specifier.scheme() == "jet" {
-                (
-                    MediaType::TypeScript,
-                    deno_core::ModuleType::JavaScript,
-                    true,
-                    String::from(
-                        r#"
-                        export namespace JetRuntime {
-                            export function greet(name: string): void {
-                                console.log(`Hello ${name}`);
-                            }
-                        }
-                        "#,
-                    ),
-                )
-            } else {
-                let path = module_specifier.to_file_path().unwrap();
+            let (media_type, module_type, should_transpile, code) =
+                if module_specifier.scheme() == "jet" {
+                    match module_specifier.path() {
+                        "runtime" => (
+                            MediaType::TypeScript,
+                            deno_core::ModuleType::JavaScript,
+                            true,
+                            String::from(
+                                r#"
+                                export namespace JetRuntime {
+                                    export function greet(name: string): void {
+                                        console.log(`Hello ${name}`);
+                                    }
+                                }
+                                "#,
+                            ),
+                        ),
+                        "query" => (
+                            MediaType::TypeScript,
+                            deno_core::ModuleType::JavaScript,
+                            true,
+                            String::from(
+                                r#"
+                                interface Request {
+                                    to: string
+                                };
 
-                let code = std::fs::read_to_string(&path)?;
+                                interface Context {
+                                    current_user: {
+                                        name: string
+                                    }
+                                };
 
-                let media_type = MediaType::from(&path);
-                let (module_type, should_transpile) = match media_type {
-                    MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => {
-                        (deno_core::ModuleType::JavaScript, false)
+                                class Response {
+                                    status: number;
+                                    data: string;
+
+                                    constructor(status: number, data: string) {
+                                        this.status = status;
+                                        this.data = data;
+                                    }
+                                };
+
+                                export async function handle(request: Request, context: Context): Response {
+                                    return new Response(200, `Hello ${request.to}, this is ${context.current_user.name}.`);
+                                }
+                                "#,
+                            ),
+                        ),
+                        path => panic!("path {} not found", path),
                     }
-                    MediaType::Jsx => (deno_core::ModuleType::JavaScript, true),
-                    MediaType::TypeScript
-                    | MediaType::Mts
-                    | MediaType::Cts
-                    | MediaType::Dts
-                    | MediaType::Dmts
-                    | MediaType::Dcts
-                    | MediaType::Tsx => (deno_core::ModuleType::JavaScript, true),
-                    MediaType::Json => (deno_core::ModuleType::Json, false),
-                    _ => panic!("Unknown extension {:?}", path.extension()),
-                };
+                } else {
+                    let path = module_specifier.to_file_path().unwrap();
 
-                (media_type, module_type, should_transpile, code)
-            };
+                    let code = std::fs::read_to_string(&path)?;
+
+                    let media_type = MediaType::from(&path);
+                    let (module_type, should_transpile) = match media_type {
+                        MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => {
+                            (deno_core::ModuleType::JavaScript, false)
+                        }
+                        MediaType::Jsx => (deno_core::ModuleType::JavaScript, true),
+                        MediaType::TypeScript
+                        | MediaType::Mts
+                        | MediaType::Cts
+                        | MediaType::Dts
+                        | MediaType::Dmts
+                        | MediaType::Dcts
+                        | MediaType::Tsx => (deno_core::ModuleType::JavaScript, true),
+                        MediaType::Json => (deno_core::ModuleType::Json, false),
+                        _ => panic!("Unknown extension {:?}", path.extension()),
+                    };
+
+                    (media_type, module_type, should_transpile, code)
+                };
 
             let code = if should_transpile {
                 let parsed = deno_ast::parse_module(ParseParams {
@@ -120,8 +158,8 @@ impl deno_core::ModuleLoader for TsModuleLoader {
     }
 }
 
-async fn run_js(file_path: &str) -> Result<(), AnyError> {
-    let main_module = deno_core::resolve_path(file_path)?;
+async fn run_js(file_path: &str) -> Result<deno_core::serde_json::Value, AnyError> {
+    let _main_module = deno_core::resolve_path(file_path)?;
     let runjs_extension = Extension::builder("runjs")
         .esm(include_js_files!("runtime.js",))
         .ops(vec![
@@ -137,10 +175,28 @@ async fn run_js(file_path: &str) -> Result<(), AnyError> {
         ..Default::default()
     });
 
-    let mod_id = js_runtime.load_main_module(&main_module, None).await?;
-    let result = js_runtime.mod_evaluate(mod_id);
-    js_runtime.run_event_loop(false).await?;
-    result.await?
+    let value_global = js_runtime
+        .execute_script(
+            "runner",
+            r#"(async () => {
+                const query = await import("jet:query");
+                return query.handle({ to: "Alice" }, { current_user: { name: "Alice" }});
+            })();"#,
+        )
+        .unwrap();
+
+    let result_global = js_runtime.resolve_value(value_global).await.unwrap();
+    let scope = &mut js_runtime.handle_scope();
+    let local = Local::new(scope, result_global);
+
+    let deserialized_value =
+        deno_core::serde_v8::from_v8::<deno_core::serde_json::Value>(scope, local).unwrap();
+
+    let j = deno_core::serde_json::to_string(&deserialized_value).unwrap();
+
+    print!("Response: {:#?}", j);
+
+    Ok(deserialized_value)
 }
 
 fn main() {

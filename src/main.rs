@@ -5,7 +5,7 @@ use deno_core::error::AnyError;
 use deno_core::futures::FutureExt;
 use deno_core::include_js_files;
 use deno_core::op;
-use deno_core::v8::Local;
+use deno_core::v8;
 use deno_core::Extension;
 use std::rc::Rc;
 
@@ -134,8 +134,8 @@ impl deno_core::ModuleLoader for TsModuleLoader {
     }
 }
 
-async fn run_js(file_path: &str) -> Result<deno_core::serde_json::Value, AnyError> {
-    let _main_module = deno_core::resolve_path(file_path)?;
+async fn run_js(file_path: &str) -> Result<(), AnyError> {
+    let main_module = deno_core::resolve_path(file_path)?;
     let runjs_extension = Extension::builder("runjs")
         .esm(include_js_files!("runtime.js",))
         .ops(vec![
@@ -151,22 +151,79 @@ async fn run_js(file_path: &str) -> Result<deno_core::serde_json::Value, AnyErro
         ..Default::default()
     });
 
-    let runner_code = std::fs::read_to_string("src/runner.ts").expect("Can't find runner.ts.");
+    let path = main_module.to_file_path().unwrap();
+    let source_code = std::fs::read_to_string(&path)?;
 
-    let value_global = js_runtime.execute_script("runner", &runner_code).unwrap();
+    let module_id = js_runtime
+        .load_main_module(&main_module, Some(source_code))
+        .await
+        .unwrap();
 
-    let result_global = js_runtime.resolve_value(value_global).await.unwrap();
+    let evaluation = js_runtime.mod_evaluate(module_id);
+
+    js_runtime.run_event_loop(false).await.unwrap();
+
+    let _r = evaluation.await?;
+
+    let result = {
+        let module_namespace = js_runtime.get_module_namespace(module_id).unwrap();
+
+        let scope = &mut js_runtime.handle_scope();
+
+        let module_namespace = v8::Local::<v8::Object>::new(scope, module_namespace);
+
+        let default_export_name =
+            v8::String::new(scope, "handle").expect("handle functino is not exported");
+        let binding = module_namespace
+            .get(scope, default_export_name.into())
+            .unwrap();
+
+        let handle_fn =
+            v8::Local::<v8::Function>::try_from(binding).expect("handle is not a function");
+
+        let request = {
+            let data = r#"
+        {
+            "to": "Alice"
+        }"#;
+
+            let v: deno_core::serde_json::Value = deno_core::serde_json::from_str(data)?;
+
+            deno_core::serde_v8::to_v8(scope, v).expect("Bad request")
+        };
+        let context = {
+            let data = r#"
+        {
+            "current_user": {
+                "name": "Alice"
+            }
+        }"#;
+
+            let v: deno_core::serde_json::Value = deno_core::serde_json::from_str(data)?;
+
+            deno_core::serde_v8::to_v8(scope, v).expect("Bad context")
+        };
+
+        let receiver = v8::undefined(scope);
+
+        let result = handle_fn.call(scope, receiver.into(), &[request, context]);
+
+        v8::Global::new(scope, result.unwrap())
+    };
+
+    js_runtime.run_event_loop(false).await?;
+    let result_global = js_runtime.resolve_value(result).await.unwrap();
     let scope = &mut js_runtime.handle_scope();
-    let local = Local::new(scope, result_global);
+    let local = v8::Local::new(scope, result_global);
 
     let deserialized_value =
         deno_core::serde_v8::from_v8::<deno_core::serde_json::Value>(scope, local).unwrap();
 
     let j = deno_core::serde_json::to_string(&deserialized_value).unwrap();
 
-    print!("Response: {:#?}", j);
+    print!("\nPromise Result: {:#?}", j);
 
-    Ok(deserialized_value)
+    Ok(())
 }
 
 fn main() {
